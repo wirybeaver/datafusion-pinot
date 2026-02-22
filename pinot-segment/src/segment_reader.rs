@@ -161,7 +161,7 @@ impl SegmentReader {
         Ok(values)
     }
 
-    /// Read a dictionary-encoded STRING column
+    /// Read a STRING column (supports both dictionary-encoded and RAW)
     pub fn read_string_column(&self, column_name: &str) -> Result<Vec<String>> {
         let col_meta = self.metadata.get_column(column_name)?;
 
@@ -172,12 +172,21 @@ impl SegmentReader {
             )));
         }
 
-        if !col_meta.has_dictionary {
-            return Err(Error::UnsupportedFeature(
-                "RAW STRING columns not yet supported (Milestone 2)".to_string(),
-            ));
+        if col_meta.has_dictionary {
+            // Dictionary-encoded STRING
+            self.read_dict_encoded_string(column_name, col_meta)
+        } else {
+            // RAW STRING (variable-byte chunk format)
+            self.read_raw_string(column_name, col_meta)
         }
+    }
 
+    /// Read dictionary-encoded STRING column
+    fn read_dict_encoded_string(
+        &self,
+        column_name: &str,
+        col_meta: &crate::metadata::ColumnMetadata,
+    ) -> Result<Vec<String>> {
         let dict_loc = self
             .index_map
             .get_dictionary(column_name)
@@ -219,6 +228,29 @@ impl SegmentReader {
         }
 
         Ok(values)
+    }
+
+    /// Read RAW (non-dictionary) STRING column
+    fn read_raw_string(
+        &self,
+        column_name: &str,
+        col_meta: &crate::metadata::ColumnMetadata,
+    ) -> Result<Vec<String>> {
+        use crate::forward_index::VarByteChunkReader;
+
+        let fwd_loc = self.index_map.get_forward_index(column_name).ok_or_else(|| {
+            Error::InvalidFormat(format!("No forward index for {}", column_name))
+        })?;
+
+        let columns_psf = self.segment_dir.join("columns.psf");
+        let var_byte_reader = VarByteChunkReader::read(
+            &columns_psf,
+            fwd_loc.start_offset,
+            fwd_loc.size,
+            col_meta.total_docs,
+        )?;
+
+        var_byte_reader.read_all_strings()
     }
 
     /// Read a dictionary-encoded FLOAT column
