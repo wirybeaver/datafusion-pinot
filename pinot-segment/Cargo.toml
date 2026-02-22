@@ -1,0 +1,12 @@
+[package]
+name = "pinot-segment"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# No external dependencies - std library only for parsing and bit manipulation
+
+[dev-dependencies]
+# For testing

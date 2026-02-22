@@ -1,0 +1,16 @@
+[package]
+name = "datafusion-pinot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+datafusion = "44.0"
+arrow = "54.0"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "macros"] }
+pinot-segment = { path = "../pinot-segment" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
