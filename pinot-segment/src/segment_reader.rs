@@ -4,6 +4,7 @@ use crate::index_map::IndexMap;
 use crate::metadata::{DataType, SegmentMetadata};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug)]
 pub struct SegmentReader {
     segment_dir: PathBuf,
     metadata: SegmentMetadata,

@@ -7,10 +7,10 @@ authors.workspace = true
 
 [dependencies]
 datafusion = "44.0"
-arrow = "54.0"
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "macros"] }
 pinot-segment = { path = "../pinot-segment" }
+futures = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

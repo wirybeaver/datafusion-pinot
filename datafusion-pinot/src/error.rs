@@ -5,6 +5,8 @@ pub enum Error {
     PinotSegment(pinot_segment::Error),
     DataFusion(String),
     Arrow(String),
+    Internal(String),
+    UnsupportedFeature(String),
 }
 
 impl fmt::Display for Error {
@@ -13,6 +15,8 @@ impl fmt::Display for Error {
             Error::PinotSegment(e) => write!(f, "Pinot segment error: {}", e),
             Error::DataFusion(msg) => write!(f, "DataFusion error: {}", msg),
             Error::Arrow(msg) => write!(f, "Arrow error: {}", msg),
+            Error::Internal(msg) => write!(f, "Internal error: {}", msg),
+            Error::UnsupportedFeature(msg) => write!(f, "Unsupported feature: {}", msg),
         }
     }
 }

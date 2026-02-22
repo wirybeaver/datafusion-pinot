@@ -1,6 +1,9 @@
 // DataFusion integration for Apache Pinot segments
-// Implementation coming in Milestone 3
 
 pub mod error;
+pub mod exec;
+pub mod schema;
+pub mod table;
 
 pub use error::{Error, Result};
+pub use table::PinotTable;
