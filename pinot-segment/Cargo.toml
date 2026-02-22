@@ -6,7 +6,18 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-# No external dependencies - std library only for parsing and bit manipulation
+# Compression support
+lz4 = { version = "1.24", optional = true }
+# Future compression support (not yet implemented):
+# snap = { version = "1.1", optional = true }
+# zstd = { version = "0.13", optional = true }
+
+[features]
+default = ["lz4"]
 
 [dev-dependencies]
 # For testing
+
+[[example]]
+name = "read_segment"
+path = "examples/read_segment.rs"

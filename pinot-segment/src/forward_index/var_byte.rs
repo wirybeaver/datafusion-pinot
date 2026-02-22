@@ -5,21 +5,30 @@ use std::path::{Path, PathBuf};
 
 const METADATA_ENTRY_SIZE: usize = 8; // 4 bytes docId + 4 bytes offset
 
+// Compression type constants (from Pinot ChunkCompressionType)
+const PASS_THROUGH: i32 = 0;
+const SNAPPY: i32 = 1;
+const ZSTANDARD: i32 = 2;
+const LZ4: i32 = 3;
+const LZ4_LENGTH_PREFIXED: i32 = 4;
+
 /// Variable-byte chunk forward index reader for RAW (non-dictionary) columns
 /// Version 4 format (different from v2/v3)
 pub struct VarByteChunkReader {
     file_path: PathBuf,
-    _base_offset: usize,
-    _target_decompressed_chunk_size: i32,
+    base_offset: usize,
+    forward_index_size: usize,
+    target_decompressed_chunk_size: i32,
     compression_type: i32,
     metadata_offset: usize,
     metadata_size: usize,
     chunks_offset: usize,
+    total_docs: u32,
 }
 
 impl VarByteChunkReader {
     /// Read variable-byte chunk forward index (V4 format)
-    pub fn read(file_path: &Path, offset: usize, _size: usize, _total_docs: u32) -> Result<Self> {
+    pub fn read(file_path: &Path, offset: usize, size: usize, total_docs: u32) -> Result<Self> {
         let mut file = File::open(file_path)?;
         file.seek(SeekFrom::Start(offset as u64))?;
 
@@ -71,12 +80,14 @@ impl VarByteChunkReader {
 
         Ok(VarByteChunkReader {
             file_path: file_path.to_path_buf(),
-            _base_offset: offset,
-            _target_decompressed_chunk_size: target_decompressed_chunk_size,
+            base_offset: offset,
+            forward_index_size: size,
+            target_decompressed_chunk_size,
             compression_type,
             metadata_offset,
             metadata_size,
             chunks_offset,
+            total_docs,
         })
     }
 
@@ -129,16 +140,29 @@ impl VarByteChunkReader {
         // Check if this is a "huge value" (single value spanning entire chunk)
         let is_regular_chunk = (u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) & 0x80000000) == 0;
 
-        // Determine chunk limit
-        let chunk_limit = if (entry_idx + 1) * METADATA_ENTRY_SIZE < self.metadata_size {
-            // Read next entry to get limit
+        // Determine chunk limit and num_docs
+        let (chunk_limit, num_docs_in_chunk) = if (entry_idx + 1) * METADATA_ENTRY_SIZE < self.metadata_size {
+            // Read next entry to get limit and calculate num_docs
             let mut next_entry = [0u8; 8];
             file.read_exact(&mut next_entry)?;
-            u32::from_le_bytes([next_entry[4], next_entry[5], next_entry[6], next_entry[7]]) as usize
+            let next_doc_id = u32::from_le_bytes([next_entry[0], next_entry[1], next_entry[2], next_entry[3]]) & 0x7FFFFFFF;
+            let next_chunk_offset = u32::from_le_bytes([next_entry[4], next_entry[5], next_entry[6], next_entry[7]]) as usize;
+
+            // Check if next_chunk_offset is sentinel value (0xFFFFFFFF means end of chunks)
+            if next_chunk_offset == 0xFFFFFFFF {
+                // Last chunk - use forward index size to calculate limit
+                let limit = self.forward_index_size - (self.chunks_offset - self.base_offset);
+                (limit, 0) // num_docs will be read from decompressed chunk
+            } else {
+                let num_docs = (next_doc_id - chunk_doc_id_offset) as usize;
+                (next_chunk_offset, num_docs)
+            }
         } else {
-            // Last chunk goes to end of file
-            let file_size = file.metadata()?.len() as usize;
-            file_size - self.chunks_offset
+            // Last chunk - use forward index size to calculate limit
+            let limit = self.forward_index_size - (self.chunks_offset - self.base_offset);
+            // For last chunk, we need to determine num_docs from the decompressed data
+            // We'll handle this below
+            (limit, 0)
         };
 
         let chunk_size = chunk_limit - chunk_offset;
@@ -148,22 +172,38 @@ impl VarByteChunkReader {
         let mut chunk_data = vec![0u8; chunk_size];
         file.read_exact(&mut chunk_data)?;
 
-        // Handle compressed chunks
-        if self.compression_type != 0 {
-            return Err(Error::UnsupportedFeature(
-                "Compressed chunks not yet supported".to_string(),
-            ));
-        }
+        // Decompress if needed
+        let decompressed_chunk = if self.compression_type == PASS_THROUGH {
+            chunk_data
+        } else {
+            self.decompress_chunk(&chunk_data)?
+        };
 
         // For huge values, the entire chunk is the value
         if !is_regular_chunk {
-            return Ok(chunk_data);
+            return Ok(decompressed_chunk);
         }
 
-        // Regular chunk: parse structure
-        // First 4 bytes: number of docs in chunk (little-endian)
-        let num_docs_in_chunk =
-            u32::from_le_bytes([chunk_data[0], chunk_data[1], chunk_data[2], chunk_data[3]]) as usize;
+        // Regular chunk structure for V4:
+        // - num_docs: 4 bytes (LE) at position 0
+        // - Offset array: (num_docs + 1) * 4 bytes (LE) starting at position 4
+        // - String data: variable length
+
+        // If we don't know num_docs (last chunk), read it from the decompressed chunk
+        let num_docs_in_chunk = if num_docs_in_chunk == 0 {
+            if decompressed_chunk.len() < 8 {
+                return Err(Error::InvalidFormat("Decompressed chunk too small".to_string()));
+            }
+            // Read num_docs from first 4 bytes
+            u32::from_le_bytes([
+                decompressed_chunk[0],
+                decompressed_chunk[1],
+                decompressed_chunk[2],
+                decompressed_chunk[3],
+            ]) as usize
+        } else {
+            num_docs_in_chunk
+        };
 
         // Calculate index within chunk
         let doc_index_in_chunk = (doc_id - chunk_doc_id_offset) as usize;
@@ -175,30 +215,104 @@ impl VarByteChunkReader {
             )));
         }
 
-        // Read offset array (little-endian)
-        let offset_array_start = 4; // After num_docs
-        let value_offset_pos = offset_array_start + (doc_index_in_chunk + 1) * 4;
+        // Read offset for this document (offset array starts at position 4, after num_docs field)
+        let offset_pos = 4 + doc_index_in_chunk * 4;
+        if offset_pos + 4 > decompressed_chunk.len() {
+            return Err(Error::InvalidFormat(format!(
+                "Offset position {} out of range",
+                offset_pos
+            )));
+        }
+
         let value_offset = u32::from_le_bytes([
-            chunk_data[value_offset_pos],
-            chunk_data[value_offset_pos + 1],
-            chunk_data[value_offset_pos + 2],
-            chunk_data[value_offset_pos + 3],
+            decompressed_chunk[offset_pos],
+            decompressed_chunk[offset_pos + 1],
+            decompressed_chunk[offset_pos + 2],
+            decompressed_chunk[offset_pos + 3],
         ]) as usize;
 
+        // For the last document in chunk, use chunk size as next offset
+        // Otherwise read next offset from array
         let next_offset = if doc_index_in_chunk == num_docs_in_chunk - 1 {
-            chunk_data.len()
+            decompressed_chunk.len()
         } else {
-            let next_offset_pos = value_offset_pos + 4;
+            let next_offset_pos = offset_pos + 4;
+            if next_offset_pos + 4 > decompressed_chunk.len() {
+                return Err(Error::InvalidFormat(format!(
+                    "Next offset position {} out of range",
+                    next_offset_pos
+                )));
+            }
             u32::from_le_bytes([
-                chunk_data[next_offset_pos],
-                chunk_data[next_offset_pos + 1],
-                chunk_data[next_offset_pos + 2],
-                chunk_data[next_offset_pos + 3],
+                decompressed_chunk[next_offset_pos],
+                decompressed_chunk[next_offset_pos + 1],
+                decompressed_chunk[next_offset_pos + 2],
+                decompressed_chunk[next_offset_pos + 3],
             ]) as usize
         };
 
-        let value_bytes = chunk_data[value_offset..next_offset].to_vec();
+        if value_offset > decompressed_chunk.len() || next_offset > decompressed_chunk.len() {
+            return Err(Error::InvalidFormat(format!(
+                "Value offsets out of range: {} to {} (chunk size: {})",
+                value_offset, next_offset, decompressed_chunk.len()
+            )));
+        }
+
+        let value_bytes = decompressed_chunk[value_offset..next_offset].to_vec();
         Ok(value_bytes)
+    }
+
+    /// Decompress chunk data based on compression type
+    fn decompress_chunk(&self, compressed_data: &[u8]) -> Result<Vec<u8>> {
+        match self.compression_type {
+            PASS_THROUGH => Ok(compressed_data.to_vec()),
+            LZ4 | LZ4_LENGTH_PREFIXED => {
+                #[cfg(feature = "lz4")]
+                {
+                    // For LZ4_LENGTH_PREFIXED, first 4 bytes contain the decompressed size
+                    let (decompressed_size, compressed_bytes) = if self.compression_type == LZ4_LENGTH_PREFIXED {
+                        if compressed_data.len() < 4 {
+                            return Err(Error::InvalidFormat(
+                                "LZ4_LENGTH_PREFIXED data too short for length prefix".to_string(),
+                            ));
+                        }
+                        let size = u32::from_le_bytes([
+                            compressed_data[0],
+                            compressed_data[1],
+                            compressed_data[2],
+                            compressed_data[3],
+                        ]) as usize;
+                        (size, &compressed_data[4..])
+                    } else {
+                        (self.target_decompressed_chunk_size as usize, compressed_data)
+                    };
+
+                    // Decompress using lz4 block decompression
+                    let decompressed = lz4::block::decompress(compressed_bytes, Some(decompressed_size as i32))
+                        .map_err(|e| {
+                            Error::InvalidFormat(format!("LZ4 decompression failed: {}", e))
+                        })?;
+
+                    Ok(decompressed)
+                }
+                #[cfg(not(feature = "lz4"))]
+                {
+                    Err(Error::UnsupportedFeature(
+                        "LZ4 compression support not enabled. Enable 'lz4' feature.".to_string(),
+                    ))
+                }
+            }
+            SNAPPY => Err(Error::UnsupportedFeature(
+                "Snappy compression not yet supported".to_string(),
+            )),
+            ZSTANDARD => Err(Error::UnsupportedFeature(
+                "Zstandard compression not yet supported".to_string(),
+            )),
+            _ => Err(Error::UnsupportedFeature(format!(
+                "Unknown compression type: {}",
+                self.compression_type
+            ))),
+        }
     }
 
     /// Read a single value as string
@@ -210,33 +324,8 @@ impl VarByteChunkReader {
 
     /// Read all values as strings
     pub fn read_all_strings(&self) -> Result<Vec<String>> {
-        // Need to know total_docs - let's read from metadata
-        let num_entries = self.metadata_size / METADATA_ENTRY_SIZE;
-        if num_entries == 0 {
-            return Ok(Vec::new());
-        }
-
-        // Read last metadata entry to get max doc_id
-        let mut file = File::open(&self.file_path)?;
-        let last_entry_offset = self.metadata_offset + (num_entries - 1) * METADATA_ENTRY_SIZE;
-        file.seek(SeekFrom::Start(last_entry_offset as u64))?;
-        let mut entry = [0u8; 8];
-        file.read_exact(&mut entry)?;
-
-        let last_doc_id = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) & 0x7FFFFFFF;
-
-        // Need to read the chunk to find how many docs it contains
-        let chunk_offset = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]) as usize;
-
-        file.seek(SeekFrom::Start((self.chunks_offset + chunk_offset) as u64))?;
-        let mut num_docs_bytes = [0u8; 4];
-        file.read_exact(&mut num_docs_bytes)?;
-        let num_docs_in_last_chunk = u32::from_le_bytes(num_docs_bytes);
-
-        let total_docs = last_doc_id + num_docs_in_last_chunk;
-
-        let mut values = Vec::with_capacity(total_docs as usize);
-        for doc_id in 0..total_docs {
+        let mut values = Vec::with_capacity(self.total_docs as usize);
+        for doc_id in 0..self.total_docs {
             values.push(self.get_string(doc_id)?);
         }
         Ok(values)
@@ -244,29 +333,8 @@ impl VarByteChunkReader {
 
     /// Read all values as raw bytes
     pub fn read_all_bytes(&self) -> Result<Vec<Vec<u8>>> {
-        let num_entries = self.metadata_size / METADATA_ENTRY_SIZE;
-        if num_entries == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut file = File::open(&self.file_path)?;
-        let last_entry_offset = self.metadata_offset + (num_entries - 1) * METADATA_ENTRY_SIZE;
-        file.seek(SeekFrom::Start(last_entry_offset as u64))?;
-        let mut entry = [0u8; 8];
-        file.read_exact(&mut entry)?;
-
-        let last_doc_id = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) & 0x7FFFFFFF;
-        let chunk_offset = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]) as usize;
-
-        file.seek(SeekFrom::Start((self.chunks_offset + chunk_offset) as u64))?;
-        let mut num_docs_bytes = [0u8; 4];
-        file.read_exact(&mut num_docs_bytes)?;
-        let num_docs_in_last_chunk = u32::from_le_bytes(num_docs_bytes);
-
-        let total_docs = last_doc_id + num_docs_in_last_chunk;
-
-        let mut values = Vec::with_capacity(total_docs as usize);
-        for doc_id in 0..total_docs {
+        let mut values = Vec::with_capacity(self.total_docs as usize);
+        for doc_id in 0..self.total_docs {
             values.push(self.get_bytes(doc_id)?);
         }
         Ok(values)
