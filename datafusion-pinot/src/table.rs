@@ -7,42 +7,108 @@ use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use pinot_segment::SegmentReader;
 use std::any::Any;
+use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::exec::PinotExec;
-use crate::schema::{create_arrow_schema, create_projected_schema};
+use crate::schema::create_arrow_schema;
 
-/// TableProvider for a single Pinot segment
+/// TableProvider for Pinot table (one or more segments)
 #[derive(Debug)]
 pub struct PinotTable {
-    segment_reader: Arc<SegmentReader>,
+    segments: Vec<Arc<SegmentReader>>,
     schema: SchemaRef,
+    _table_name: String,
 }
 
 impl PinotTable {
-    /// Open a Pinot segment and create a table
+    /// Open a single Pinot segment and create a table
     pub fn open<P: AsRef<Path>>(segment_path: P) -> Result<Self> {
-        let segment_reader = SegmentReader::open(segment_path)
+        let segment_reader = SegmentReader::open(segment_path.as_ref())
             .map_err(|e| Error::Internal(e.to_string()))?;
 
         let schema = create_arrow_schema(segment_reader.metadata())?;
+        let table_name = segment_reader.metadata().table_name.clone();
 
         Ok(Self {
-            segment_reader: Arc::new(segment_reader),
+            segments: vec![Arc::new(segment_reader)],
             schema,
+            _table_name: table_name,
         })
     }
 
-    /// Create from an existing SegmentReader
-    pub fn from_reader(segment_reader: SegmentReader) -> Result<Self> {
-        let schema = create_arrow_schema(segment_reader.metadata())?;
+    /// Open all segments for a Pinot table
+    pub fn open_table<P: AsRef<Path>>(table_dir: P) -> Result<Self> {
+        let table_dir = table_dir.as_ref();
+
+        // Read all segment directories
+        let entries = fs::read_dir(table_dir)
+            .map_err(|e| Error::Internal(format!("Failed to read table directory: {}", e)))?;
+
+        let mut segment_paths = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| Error::Internal(e.to_string()))?;
+            let path = entry.path();
+
+            // Skip non-directories and temporary directories
+            if !path.is_dir() || path.file_name().unwrap().to_str().unwrap() == "tmp" {
+                continue;
+            }
+
+            // Check if it's a valid segment (has v3 subdirectory)
+            let v3_path = path.join("v3");
+            if v3_path.exists() && v3_path.is_dir() {
+                segment_paths.push(v3_path);
+            }
+        }
+
+        if segment_paths.is_empty() {
+            return Err(Error::Internal(format!(
+                "No valid segments found in {}",
+                table_dir.display()
+            )));
+        }
+
+        // Sort for consistent ordering
+        segment_paths.sort();
+
+        // Load all segments
+        let mut segments = Vec::new();
+        let mut schema = None;
+        let mut table_name = String::new();
+
+        for segment_path in segment_paths {
+            let segment_reader = SegmentReader::open(&segment_path)
+                .map_err(|e| Error::Internal(format!("Failed to open segment {:?}: {}", segment_path, e)))?;
+
+            if schema.is_none() {
+                schema = Some(create_arrow_schema(segment_reader.metadata())?);
+                table_name = segment_reader.metadata().table_name.clone();
+            }
+
+            segments.push(Arc::new(segment_reader));
+        }
 
         Ok(Self {
-            segment_reader: Arc::new(segment_reader),
-            schema,
+            segments,
+            schema: schema.unwrap(),
+            _table_name: table_name,
         })
+    }
+
+    /// Get the number of segments
+    pub fn num_segments(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Get total number of documents across all segments
+    pub fn total_docs(&self) -> u64 {
+        self.segments
+            .iter()
+            .map(|s| s.metadata().total_docs as u64)
+            .sum()
     }
 }
 
@@ -67,16 +133,9 @@ impl TableProvider for PinotTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let projected_schema = if let Some(proj) = projection {
-            create_projected_schema(self.schema.as_ref(), proj)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?
-        } else {
-            self.schema.clone()
-        };
-
         Ok(Arc::new(PinotExec::new(
-            self.segment_reader.clone(),
-            projected_schema,
+            self.segments.clone(),
+            self.schema.clone(),
             projection.cloned(),
         )))
     }
@@ -87,6 +146,7 @@ mod tests {
     use super::*;
 
     const SEGMENT_DIR: &str = "/tmp/pinot/quickstart/PinotServerDataDir0/baseballStats_OFFLINE/baseballStats_OFFLINE_0_e40936cc-16f8-490e-a85f-bc61a9abee66/v3";
+    const TABLE_DIR: &str = "/tmp/pinot/quickstart/PinotServerDataDir0/baseballStats_OFFLINE";
 
     #[test]
     fn test_pinot_table_open() {
@@ -105,5 +165,21 @@ mod tests {
         assert!(schema.field_with_name("playerID").is_ok());
         assert!(schema.field_with_name("teamID").is_ok());
         assert!(schema.field_with_name("hits").is_ok());
+    }
+
+    #[test]
+    fn test_open_table_multi_segment() {
+        if !Path::new(TABLE_DIR).exists() {
+            println!("Skipping test: table directory not found");
+            return;
+        }
+
+        let table = PinotTable::open_table(TABLE_DIR).expect("Failed to open table");
+
+        assert!(table.num_segments() >= 1, "Should have at least one segment");
+        assert!(table.total_docs() > 0, "Should have documents");
+
+        println!("Loaded {} segments with {} total docs",
+                 table.num_segments(), table.total_docs());
     }
 }

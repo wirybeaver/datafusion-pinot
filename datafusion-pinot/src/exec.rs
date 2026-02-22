@@ -8,7 +8,7 @@ use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskCo
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 use futures::stream::Stream;
 use pinot_segment::{DataType as PinotDataType, SegmentReader};
@@ -19,47 +19,70 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::error::{Error, Result};
+use crate::schema::create_projected_schema;
 
 const BATCH_SIZE: usize = 8192;
 
-/// Execution plan for reading Pinot segments
+/// Execution plan for reading Pinot segments (supports multi-segment tables)
 #[derive(Debug)]
 pub struct PinotExec {
-    segment_reader: Arc<SegmentReader>,
-    projected_schema: SchemaRef,
+    segments: Vec<Arc<SegmentReader>>,
+    schema: SchemaRef,
     projection: Option<Vec<usize>>,
     plan_properties: PlanProperties,
 }
 
 impl PinotExec {
     pub fn new(
-        segment_reader: Arc<SegmentReader>,
-        projected_schema: SchemaRef,
+        segments: Vec<Arc<SegmentReader>>,
+        schema: SchemaRef,
         projection: Option<Vec<usize>>,
     ) -> Self {
+        let num_partitions = segments.len();
+
+        // Calculate projected schema
+        let projected_schema = if let Some(ref proj) = projection {
+            create_projected_schema(schema.as_ref(), proj).unwrap_or(schema.clone())
+        } else {
+            schema.clone()
+        };
+
         let plan_properties = PlanProperties::new(
             EquivalenceProperties::new(projected_schema.clone()),
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+            Partitioning::UnknownPartitioning(num_partitions),
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
 
         Self {
-            segment_reader,
-            projected_schema,
+            segments,
+            schema: projected_schema,
             projection,
             plan_properties,
         }
     }
 
-    fn create_batch(&self, offset: usize, limit: usize) -> Result<RecordBatch> {
-        let column_names: Vec<String> = if let Some(ref projection) = self.projection {
-            projection
-                .iter()
-                .map(|&idx| self.segment_reader.metadata().columns.keys().nth(idx).unwrap().clone())
+    fn create_batch(
+        segment_reader: &SegmentReader,
+        schema: &SchemaRef,
+        projection: &Option<Vec<usize>>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<RecordBatch> {
+        let column_names: Vec<String> = if let Some(ref proj) = projection {
+            proj.iter()
+                .map(|&idx| {
+                    segment_reader
+                        .metadata()
+                        .columns
+                        .keys()
+                        .nth(idx)
+                        .unwrap()
+                        .clone()
+                })
                 .collect()
         } else {
-            self.segment_reader
+            segment_reader
                 .metadata()
                 .columns
                 .keys()
@@ -68,30 +91,26 @@ impl PinotExec {
         };
 
         // Handle empty projection (e.g., COUNT(*) queries)
-        // Create batches with correct row count but no columns
         if column_names.is_empty() {
             let options = RecordBatchOptions::new().with_row_count(Some(limit));
-            return RecordBatch::try_new_with_options(self.projected_schema.clone(), vec![], &options)
+            return RecordBatch::try_new_with_options(schema.clone(), vec![], &options)
                 .map_err(|e| Error::Internal(format!("Failed to create RecordBatch: {}", e)));
         }
 
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_names.len());
 
         for column_name in column_names.iter() {
-            let col_meta = self
-                .segment_reader
+            let col_meta = segment_reader
                 .metadata()
                 .get_column(column_name)
                 .map_err(|e| Error::Internal(e.to_string()))?;
 
             let array: ArrayRef = match col_meta.data_type {
                 PinotDataType::Int => {
-                    let mut values = self
-                        .segment_reader
+                    let mut values = segment_reader
                         .read_int_column(column_name)
                         .map_err(|e| Error::Internal(e.to_string()))?;
 
-                    // Extract the slice for this batch
                     let batch_values = if offset + limit <= values.len() {
                         values.drain(offset..offset + limit).collect::<Vec<_>>()
                     } else {
@@ -101,8 +120,7 @@ impl PinotExec {
                     Arc::new(Int32Array::from(batch_values))
                 }
                 PinotDataType::Long => {
-                    let mut values = self
-                        .segment_reader
+                    let mut values = segment_reader
                         .read_long_column(column_name)
                         .map_err(|e| Error::Internal(e.to_string()))?;
 
@@ -115,8 +133,7 @@ impl PinotExec {
                     Arc::new(Int64Array::from(batch_values))
                 }
                 PinotDataType::Float => {
-                    let mut values = self
-                        .segment_reader
+                    let mut values = segment_reader
                         .read_float_column(column_name)
                         .map_err(|e| Error::Internal(e.to_string()))?;
 
@@ -129,8 +146,7 @@ impl PinotExec {
                     Arc::new(Float32Array::from(batch_values))
                 }
                 PinotDataType::Double => {
-                    let mut values = self
-                        .segment_reader
+                    let mut values = segment_reader
                         .read_double_column(column_name)
                         .map_err(|e| Error::Internal(e.to_string()))?;
 
@@ -143,8 +159,7 @@ impl PinotExec {
                     Arc::new(Float64Array::from(batch_values))
                 }
                 PinotDataType::String => {
-                    let mut values = self
-                        .segment_reader
+                    let mut values = segment_reader
                         .read_string_column(column_name)
                         .map_err(|e| Error::Internal(e.to_string()))?;
 
@@ -167,14 +182,19 @@ impl PinotExec {
             arrays.push(array);
         }
 
-        RecordBatch::try_new(self.projected_schema.clone(), arrays)
+        RecordBatch::try_new(schema.clone(), arrays)
             .map_err(|e| Error::Internal(format!("Failed to create RecordBatch: {}", e)))
     }
 }
 
 impl DisplayAs for PinotExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "PinotExec")
+        write!(
+            f,
+            "PinotExec: segments={}, partitions={}",
+            self.segments.len(),
+            self.segments.len()
+        )
     }
 }
 
@@ -188,7 +208,7 @@ impl ExecutionPlan for PinotExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.projected_schema.clone()
+        self.schema.clone()
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -208,21 +228,38 @@ impl ExecutionPlan for PinotExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let total_docs = self.segment_reader.metadata().total_docs as usize;
+        // Each partition reads from one segment
+        let segment_reader = self
+            .segments
+            .get(partition)
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Partition {} out of range (have {} segments)",
+                    partition,
+                    self.segments.len()
+                ))
+            })?
+            .clone();
+
+        let total_docs = segment_reader.metadata().total_docs as usize;
+        let schema = self.schema.clone();
+        let projection = self.projection.clone();
+
+        // Create batches for this segment
         let batches = (0..total_docs)
             .step_by(BATCH_SIZE)
             .map(|offset| {
                 let limit = BATCH_SIZE.min(total_docs - offset);
-                self.create_batch(offset, limit)
+                Self::create_batch(&segment_reader, &schema, &projection, offset, limit)
             })
             .collect::<Result<Vec<_>>>()
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         Ok(Box::pin(PinotStream {
-            schema: self.projected_schema.clone(),
+            schema,
             batches,
             index: 0,
         }))
