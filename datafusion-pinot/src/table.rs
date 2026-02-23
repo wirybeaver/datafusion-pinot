@@ -74,18 +74,47 @@ impl PinotTable {
         // Sort for consistent ordering
         segment_paths.sort();
 
+        // Use open_segments to load all segments
+        let table_name = table_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        Self::open_segments(&segment_paths, table_name)
+    }
+
+    /// Open segments from a list of paths
+    ///
+    /// This method is used by the catalog to open tables when segment paths
+    /// are provided by a MetadataProvider.
+    ///
+    /// # Arguments
+    /// * `segment_paths` - Vector of paths to segment directories (typically v3 directories)
+    /// * `table_name` - Name of the table (used for error messages if segments have no metadata)
+    pub fn open_segments<P: AsRef<Path>>(segment_paths: &[P], table_name: &str) -> Result<Self> {
+        if segment_paths.is_empty() {
+            return Err(Error::Internal(format!(
+                "No segments provided for table '{}'",
+                table_name
+            )));
+        }
+
         // Load all segments
         let mut segments = Vec::new();
         let mut schema = None;
-        let mut table_name = String::new();
+        let mut actual_table_name = table_name.to_string();
 
         for segment_path in segment_paths {
-            let segment_reader = SegmentReader::open(&segment_path)
-                .map_err(|e| Error::Internal(format!("Failed to open segment {:?}: {}", segment_path, e)))?;
+            let segment_reader = SegmentReader::open(segment_path.as_ref()).map_err(|e| {
+                Error::Internal(format!(
+                    "Failed to open segment {:?}: {}",
+                    segment_path.as_ref(),
+                    e
+                ))
+            })?;
 
             if schema.is_none() {
                 schema = Some(create_arrow_schema(segment_reader.metadata())?);
-                table_name = segment_reader.metadata().table_name.clone();
+                actual_table_name = segment_reader.metadata().table_name.clone();
             }
 
             segments.push(Arc::new(segment_reader));
@@ -94,7 +123,7 @@ impl PinotTable {
         Ok(Self {
             segments,
             schema: schema.unwrap(),
-            _table_name: table_name,
+            _table_name: actual_table_name,
         })
     }
 

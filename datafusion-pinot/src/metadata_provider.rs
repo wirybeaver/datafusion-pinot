@@ -38,7 +38,7 @@ use crate::controller::PinotControllerClient;
 /// }
 /// ```
 #[async_trait]
-pub trait MetadataProvider: Send + Sync {
+pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// List all available table names
     ///
     /// # Returns

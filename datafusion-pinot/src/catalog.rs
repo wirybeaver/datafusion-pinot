@@ -2,11 +2,11 @@ use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use std::any::Any;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::metadata_provider::{FileSystemMetadataProvider, MetadataProvider};
 use crate::table::PinotTable;
 
 /// Catalog provider for Pinot tables
@@ -28,11 +28,10 @@ impl PinotCatalog {
             )));
         }
 
-        let schema_provider = Arc::new(PinotSchemaProvider::new(data_dir.clone()));
+        let metadata_provider = Arc::new(FileSystemMetadataProvider::new(data_dir));
+        let schema_provider = Arc::new(PinotSchemaProvider::new(metadata_provider));
 
-        Ok(Self {
-            schema_provider,
-        })
+        Ok(Self { schema_provider })
     }
 }
 
@@ -54,46 +53,15 @@ impl CatalogProvider for PinotCatalog {
     }
 }
 
-/// Schema provider for Pinot (discovers tables in data directory)
+/// Schema provider for Pinot (discovers tables using MetadataProvider)
 #[derive(Debug)]
 pub struct PinotSchemaProvider {
-    data_dir: PathBuf,
+    metadata_provider: Arc<dyn MetadataProvider>,
 }
 
 impl PinotSchemaProvider {
-    pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir }
-    }
-
-    /// Scan data directory for Pinot tables
-    fn discover_tables(&self) -> Result<Vec<String>> {
-        let entries = fs::read_dir(&self.data_dir)
-            .map_err(|e| Error::Internal(format!("Failed to read data directory: {}", e)))?;
-
-        let mut table_names = Vec::new();
-
-        for entry in entries {
-            let entry = entry.map_err(|e| Error::Internal(e.to_string()))?;
-            let path = entry.path();
-
-            // Look for directories ending with _OFFLINE or _REALTIME
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with("_OFFLINE") {
-                    // Strip _OFFLINE suffix to get table name
-                    let table_name = name.strip_suffix("_OFFLINE").unwrap().to_string();
-                    table_names.push(table_name);
-                } else if name.ends_with("_REALTIME") {
-                    // Strip _REALTIME suffix
-                    let table_name = name.strip_suffix("_REALTIME").unwrap().to_string();
-                    if !table_names.contains(&table_name) {
-                        table_names.push(table_name);
-                    }
-                }
-            }
-        }
-
-        table_names.sort();
-        Ok(table_names)
+    pub fn new(metadata_provider: Arc<dyn MetadataProvider>) -> Self {
+        Self { metadata_provider }
     }
 }
 
@@ -104,32 +72,44 @@ impl SchemaProvider for PinotSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        self.discover_tables().unwrap_or_default()
+        // Convert async to sync - try to use existing runtime, or create one if needed
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle
+                .block_on(self.metadata_provider.list_tables())
+                .unwrap_or_default(),
+            Err(_) => {
+                // No runtime exists, create a temporary one
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(self.metadata_provider.list_tables())
+                    .unwrap_or_default()
+            }
+        }
     }
 
     async fn table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
-        // Try to open OFFLINE table first, then REALTIME
-        let offline_dir = self.data_dir.join(format!("{}_OFFLINE", name));
-        let realtime_dir = self.data_dir.join(format!("{}_REALTIME", name));
-
-        let table_dir = if offline_dir.exists() {
-            offline_dir
-        } else if realtime_dir.exists() {
-            realtime_dir
-        } else {
-            return Ok(None);
+        // Get segment paths from metadata provider
+        let segment_paths = match self.metadata_provider.get_segment_paths(name).await {
+            Ok(paths) => paths,
+            Err(_) => return Ok(None),
         };
 
-        match PinotTable::open_table(&table_dir) {
+        // Open table from segment paths
+        match PinotTable::open_segments(&segment_paths, name) {
             Ok(table) => Ok(Some(Arc::new(table))),
             Err(e) => Err(DataFusionError::External(Box::new(e))),
         }
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        let offline_dir = self.data_dir.join(format!("{}_OFFLINE", name));
-        let realtime_dir = self.data_dir.join(format!("{}_REALTIME", name));
-        offline_dir.exists() || realtime_dir.exists()
+        // Convert async to sync - try to use existing runtime, or create one if needed
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle.block_on(self.metadata_provider.table_exists(name)),
+            Err(_) => {
+                // No runtime exists, create a temporary one
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(self.metadata_provider.table_exists(name))
+            }
+        }
     }
 }
 
