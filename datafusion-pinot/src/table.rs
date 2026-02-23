@@ -2,7 +2,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::datasource::TableProvider;
-use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use pinot_segment::SegmentReader;

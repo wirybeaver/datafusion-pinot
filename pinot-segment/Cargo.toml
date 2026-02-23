@@ -19,5 +19,5 @@ default = ["lz4"]
 # For testing
 
 [[example]]
-name = "read_segment"
-path = "examples/read_segment.rs"
+name = "segment_reader_demo"
+path = "examples/segment_reader_demo.rs"

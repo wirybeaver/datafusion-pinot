@@ -12,7 +12,6 @@ use crate::table::PinotTable;
 /// Catalog provider for Pinot tables
 #[derive(Debug)]
 pub struct PinotCatalog {
-    data_dir: PathBuf,
     schema_provider: Arc<PinotSchemaProvider>,
 }
 
@@ -32,7 +31,6 @@ impl PinotCatalog {
         let schema_provider = Arc::new(PinotSchemaProvider::new(data_dir.clone()));
 
         Ok(Self {
-            data_dir,
             schema_provider,
         })
     }
