@@ -4,13 +4,26 @@ use std::sync::Arc;
 
 /// Example: Query local Pinot segments using DataFusion
 ///
+/// This demonstrates the **filesystem mode** where tables are discovered
+/// by scanning local directories.
+///
+/// ## When to use filesystem mode:
+/// - Static table discovery from local directories
+/// - No need for controller HTTP API
+/// - Simpler setup for local testing
+///
+/// ## When to use controller mode:
+/// - Dynamic table discovery from running Pinot cluster
+/// - Tables may change over time
+/// - See query_controller.rs example (requires 'controller' feature)
+///
 /// This demonstrates how to:
 /// 1. Create a Pinot catalog from a local data directory
 /// 2. Register it with DataFusion
 /// 3. Execute SQL queries against Pinot tables
 ///
 /// Usage:
-///   cargo run --example query_local
+///   PINOT_DATA_DIR=/path/to/data cargo run --example query_local
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Point to your Pinot data directory
@@ -23,9 +36,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create DataFusion session context
     let ctx = SessionContext::new();
 
-    // Create and register Pinot catalog
+    // Create and register Pinot catalog (filesystem mode)
     println!("🔌 Connecting to Pinot data directory: {}", data_dir);
+
+    // Option 1: Using the simple constructor (recommended for filesystem mode)
     let catalog = PinotCatalog::new(&data_dir)?;
+
+    // Option 2: Using the builder pattern (for more control)
+    // let catalog = PinotCatalog::builder()
+    //     .filesystem(&data_dir)
+    //     .build()?;
+
     ctx.register_catalog("pinot", Arc::new(catalog));
 
     // Discover available tables
