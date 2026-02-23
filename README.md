@@ -380,62 +380,6 @@ ctx.register_table("myTable", Arc::new(table))?;
 let df = ctx.sql("SELECT COUNT(*) FROM myTable").await?;
 ```
 
-## Troubleshooting
-
-### Controller Mode Issues
-
-**Segments not found locally:**
-```
-Error: Segment baseballStats_OFFLINE_0 not found locally at /tmp/pinot/...
-```
-- **Cause**: Controller API returned segment names, but they don't exist on local filesystem
-- **Solution**: Ensure Docker volume mount matches segment directory:
-  ```bash
-  # Docker -v mount must match -dataDir parameter
-  docker run -v /tmp/pinot:/tmp/data ... -dataDir /tmp/data
-
-  # Then use the host path for segment_dir
-  .with_segment_dir("/tmp/pinot/quickstart/PinotServerDataDir0")
-  ```
-
-**Controller connection refused:**
-```
-Error: HTTP client error: connection refused
-```
-- **Cause**: Controller not accessible at specified URL
-- **Solution**: Verify controller is running and port is exposed:
-  ```bash
-  docker ps  # Check port mapping
-  curl http://localhost:9000/tables  # Test controller API
-  ```
-
-**Understanding Docker volume mounts:**
-```bash
-# -v /tmp/pinot:/tmp/data means:
-#   Host path: /tmp/pinot
-#   Container path: /tmp/data
-#
-# -dataDir /tmp/data tells Pinot to use /tmp/data INSIDE container
-# This creates: /tmp/data/quickstart/PinotServerDataDir0/ (in container)
-# Which maps to: /tmp/pinot/quickstart/PinotServerDataDir0/ (on host)
-#
-# So use the HOST path in with_segment_dir():
-.with_segment_dir("/tmp/pinot/quickstart/PinotServerDataDir0")
-```
-
-### General Issues
-
-**Table names with special characters:**
-```rust
-// Use quoted identifiers for tables with special characters
-ctx.sql("SELECT * FROM pinot.default.\"baseballStats\"").await?;
-```
-
-**No tables discovered:**
-- Verify data directory exists and contains `*_OFFLINE` or `*_REALTIME` subdirectories
-- Check directory permissions
-- Enable logging to see discovery details
-
 ## Contributing
 
 Contributions are welcome! This project follows these principles:
@@ -444,8 +388,6 @@ Contributions are welcome! This project follows these principles:
 - **Test-driven** - Tests before features
 - **Zero unsafe code** - Rust safety guarantees
 - **Clear errors** - Helpful error messages
-
-See [AGENTS.md](AGENTS.md) for detailed development guidelines.
 
 ## Roadmap
 
