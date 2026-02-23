@@ -28,11 +28,16 @@
 //!    cargo run --features controller --example query_controller
 //!    ```
 
+#[cfg(feature = "controller")]
 use datafusion::prelude::*;
+#[cfg(feature = "controller")]
 use datafusion_pinot::PinotCatalog;
+#[cfg(feature = "controller")]
 use std::env;
+#[cfg(feature = "controller")]
 use std::sync::Arc;
 
+#[cfg(feature = "controller")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get configuration from environment variables
@@ -101,4 +106,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(not(feature = "controller"))]
+fn main() {
+    eprintln!("This example requires the 'controller' feature to be enabled.");
+    eprintln!("Run with: cargo run --features controller --example query_controller");
+    std::process::exit(1);
 }
