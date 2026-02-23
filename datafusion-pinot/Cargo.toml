@@ -12,5 +12,15 @@ tokio = { version = "1", features = ["rt", "macros"] }
 pinot-segment = { path = "../pinot-segment" }
 futures = "0.3"
 
+# Optional controller dependencies
+reqwest = { version = "0.12", features = ["json"], optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+
+[features]
+default = []
+controller = ["reqwest", "serde", "serde_json"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"
