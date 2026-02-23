@@ -2,12 +2,18 @@ use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use std::any::Any;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::metadata_provider::{FileSystemMetadataProvider, MetadataProvider};
 use crate::table::PinotTable;
+
+#[cfg(feature = "controller")]
+use crate::controller::PinotControllerClient;
+
+#[cfg(feature = "controller")]
+use crate::metadata_provider::ControllerMetadataProvider;
 
 /// Catalog provider for Pinot tables
 #[derive(Debug)]
@@ -33,6 +39,36 @@ impl PinotCatalog {
 
         Ok(Self { schema_provider })
     }
+
+    /// Create a builder for configuring a Pinot catalog
+    ///
+    /// The builder allows you to choose between filesystem and controller modes.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Filesystem mode
+    /// let catalog = PinotCatalog::builder()
+    ///     .filesystem("/tmp/pinot/quickstart/PinotServerDataDir0")
+    ///     .build()?;
+    ///
+    /// // Controller mode (requires 'controller' feature)
+    /// let catalog = PinotCatalog::builder()
+    ///     .controller("http://localhost:9000")
+    ///     .with_segment_dir("/tmp/pinot/quickstart/PinotServerDataDir0")
+    ///     .build()?;
+    /// ```
+    pub fn builder() -> PinotCatalogBuilder {
+        PinotCatalogBuilder::default()
+    }
+
+    /// Create a catalog from a metadata provider
+    ///
+    /// This is a low-level API for advanced use cases. Most users should use
+    /// `new()` or `builder()` instead.
+    pub fn from_provider(metadata_provider: Arc<dyn MetadataProvider>) -> Self {
+        let schema_provider = Arc::new(PinotSchemaProvider::new(metadata_provider));
+        Self { schema_provider }
+    }
 }
 
 impl CatalogProvider for PinotCatalog {
@@ -49,6 +85,188 @@ impl CatalogProvider for PinotCatalog {
             Some(self.schema_provider.clone())
         } else {
             None
+        }
+    }
+}
+
+/// Builder for configuring a PinotCatalog
+///
+/// Supports two modes:
+/// - **Filesystem mode**: Discovers tables by scanning local directories
+/// - **Controller mode**: Discovers tables via HTTP API, reads data from local filesystem
+///
+/// # Example - Filesystem Mode
+/// ```ignore
+/// let catalog = PinotCatalog::builder()
+///     .filesystem("/tmp/pinot/quickstart/PinotServerDataDir0")
+///     .build()?;
+/// ```
+///
+/// # Example - Controller Mode (requires 'controller' feature)
+/// ```ignore
+/// let catalog = PinotCatalog::builder()
+///     .controller("http://localhost:9000")
+///     .with_segment_dir("/tmp/pinot/quickstart/PinotServerDataDir0")
+///     .build()?;
+/// ```
+#[derive(Default)]
+pub struct PinotCatalogBuilder {
+    source: Option<PinotCatalogSource>,
+}
+
+/// Configuration source for PinotCatalog
+pub enum PinotCatalogSource {
+    /// Filesystem-based discovery (scans local directories)
+    FileSystem { data_dir: PathBuf },
+
+    /// Controller-based discovery (HTTP API + local filesystem)
+    #[cfg(feature = "controller")]
+    Controller {
+        base_url: String,
+        segment_dir: PathBuf,
+    },
+}
+
+impl PinotCatalogBuilder {
+    /// Configure catalog to use filesystem-based discovery
+    ///
+    /// # Arguments
+    /// * `data_dir` - Root directory containing table directories (e.g., `/tmp/pinot/quickstart/PinotServerDataDir0`)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let catalog = PinotCatalog::builder()
+    ///     .filesystem("/tmp/pinot/quickstart/PinotServerDataDir0")
+    ///     .build()?;
+    /// ```
+    pub fn filesystem<P: Into<PathBuf>>(mut self, data_dir: P) -> Self {
+        self.source = Some(PinotCatalogSource::FileSystem {
+            data_dir: data_dir.into(),
+        });
+        self
+    }
+
+    /// Configure catalog to use controller-based discovery
+    ///
+    /// Requires the `controller` feature to be enabled.
+    ///
+    /// # Arguments
+    /// * `base_url` - Base URL of the Pinot controller (e.g., "http://localhost:9000")
+    ///
+    /// # Note
+    /// You must also call `with_segment_dir()` to specify where segment data is located.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let catalog = PinotCatalog::builder()
+    ///     .controller("http://localhost:9000")
+    ///     .with_segment_dir("/tmp/pinot/quickstart/PinotServerDataDir0")
+    ///     .build()?;
+    /// ```
+    #[cfg(feature = "controller")]
+    pub fn controller(mut self, base_url: impl Into<String>) -> Self {
+        // If we already have a controller source, update the URL
+        // Otherwise, create a new controller source with empty segment_dir
+        match self.source {
+            Some(PinotCatalogSource::Controller {
+                ref segment_dir, ..
+            }) => {
+                self.source = Some(PinotCatalogSource::Controller {
+                    base_url: base_url.into(),
+                    segment_dir: segment_dir.clone(),
+                });
+            }
+            _ => {
+                self.source = Some(PinotCatalogSource::Controller {
+                    base_url: base_url.into(),
+                    segment_dir: PathBuf::new(),
+                });
+            }
+        }
+        self
+    }
+
+    /// Specify the local directory containing segment data
+    ///
+    /// This is required when using controller mode.
+    ///
+    /// # Arguments
+    /// * `dir` - Directory containing segment data (e.g., `/tmp/pinot/quickstart/PinotServerDataDir0`)
+    #[cfg(feature = "controller")]
+    pub fn with_segment_dir<P: Into<PathBuf>>(mut self, dir: P) -> Self {
+        // If we already have a controller source, update the segment_dir
+        // Otherwise, create a new controller source with empty base_url
+        match self.source {
+            Some(PinotCatalogSource::Controller { ref base_url, .. }) => {
+                self.source = Some(PinotCatalogSource::Controller {
+                    base_url: base_url.clone(),
+                    segment_dir: dir.into(),
+                });
+            }
+            _ => {
+                self.source = Some(PinotCatalogSource::Controller {
+                    base_url: String::new(),
+                    segment_dir: dir.into(),
+                });
+            }
+        }
+        self
+    }
+
+    /// Build the PinotCatalog
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - No source has been configured
+    /// - Data directory doesn't exist (filesystem mode)
+    /// - Controller URL or segment directory missing (controller mode)
+    pub fn build(self) -> Result<PinotCatalog> {
+        let source = self
+            .source
+            .ok_or_else(|| Error::Internal("No catalog source configured".to_string()))?;
+
+        match source {
+            PinotCatalogSource::FileSystem { data_dir } => {
+                if !data_dir.exists() {
+                    return Err(Error::Internal(format!(
+                        "Data directory does not exist: {}",
+                        data_dir.display()
+                    )));
+                }
+
+                let metadata_provider = Arc::new(FileSystemMetadataProvider::new(data_dir));
+                Ok(PinotCatalog::from_provider(metadata_provider))
+            }
+
+            #[cfg(feature = "controller")]
+            PinotCatalogSource::Controller {
+                base_url,
+                segment_dir,
+            } => {
+                if base_url.is_empty() {
+                    return Err(Error::Internal(
+                        "Controller URL not specified".to_string(),
+                    ));
+                }
+
+                if segment_dir.as_os_str().is_empty() {
+                    return Err(Error::Internal(
+                        "Segment directory not specified".to_string(),
+                    ));
+                }
+
+                if !segment_dir.exists() {
+                    return Err(Error::Internal(format!(
+                        "Segment directory does not exist: {}",
+                        segment_dir.display()
+                    )));
+                }
+
+                let client = Arc::new(PinotControllerClient::new(base_url));
+                let metadata_provider =
+                    Arc::new(ControllerMetadataProvider::new(client, segment_dir));
+                Ok(PinotCatalog::from_provider(metadata_provider))
+            }
         }
     }
 }
