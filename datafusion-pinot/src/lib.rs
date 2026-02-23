@@ -12,7 +12,7 @@ pub mod controller;
 
 pub use catalog::PinotCatalog;
 pub use error::{Error, Result};
-pub use metadata_provider::MetadataProvider;
+pub use metadata_provider::{FileSystemMetadataProvider, MetadataProvider};
 pub use table::PinotTable;
 
 #[cfg(feature = "controller")]
