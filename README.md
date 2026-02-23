@@ -10,9 +10,10 @@ A Rust library that integrates Apache Pinot's segment format with Apache DataFus
 ✅ **Dictionary & RAW Encoding** - Read both dictionary-encoded and RAW columns
 ✅ **LZ4 Compression** - Support for LZ4-compressed RAW columns
 ✅ **Multi-Segment Tables** - Query tables with multiple segments in parallel
-✅ **Automatic Discovery** - Catalog-based table discovery
+✅ **Automatic Discovery** - Catalog-based table discovery via filesystem or controller API
 ✅ **Zero-Copy** - Direct segment reading without Pinot server overhead
 ✅ **Type Safety** - Full Rust type system with Arrow integration
+✅ **Controller API Support** - Dynamic table discovery from running Pinot clusters
 
 ## Quick Start
 
@@ -60,13 +61,91 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Discovery Modes
+
+DataFusion-Pinot supports two modes for discovering tables:
+
+### Filesystem Mode (Default)
+
+Discovers tables by scanning local directories for `*_OFFLINE` and `*_REALTIME` patterns. Simple and requires no running Pinot instance.
+
+```rust
+use datafusion_pinot::PinotCatalog;
+
+// Simple constructor
+let catalog = PinotCatalog::new("/tmp/pinot/quickstart/PinotServerDataDir0")?;
+
+// Or using builder
+let catalog = PinotCatalog::builder()
+    .filesystem("/tmp/pinot/quickstart/PinotServerDataDir0")
+    .build()?;
+```
+
+**When to use:**
+- Static table discovery from local directories
+- Testing and development
+- Tables don't change frequently
+- Simpler setup without controller dependency
+
+### Controller Mode (Requires `controller` feature)
+
+Discovers tables dynamically via Pinot controller HTTP API, while reading segment data from local filesystem. Enables hybrid metadata discovery with local data access.
+
+```toml
+[dependencies]
+datafusion-pinot = { version = "0.1", features = ["controller"] }
+```
+
+```rust
+use datafusion_pinot::PinotCatalog;
+
+let catalog = PinotCatalog::builder()
+    .controller("http://localhost:9000")
+    .with_segment_dir("/tmp/pinot/quickstart/PinotServerDataDir0")
+    .build()?;
+```
+
+**When to use:**
+- Dynamic table discovery from running Pinot cluster
+- Tables may change over time
+- Want to query the same tables the cluster serves
+- Need centralized metadata management
+
+**Docker setup for controller mode:**
+
+```bash
+# Start Pinot with volume-mounted data directory
+docker run -d \
+  --name pinot-quickstart \
+  -p 9000:9000 \
+  -v /tmp/pinot:/tmp/data \
+  apachepinot/pinot:latest QuickStart \
+  -type batch \
+  -dataDir /tmp/data
+
+# Now segments are accessible at:
+# - Controller API: http://localhost:9000
+# - Local filesystem: /tmp/pinot/quickstart/PinotServerDataDir0
+```
+
+**How it works:**
+1. Controller API (`GET /tables`) provides list of available tables
+2. Controller API (`GET /segments/{table}?type=OFFLINE`) lists segment names
+3. Segment data read from local filesystem (zero-copy, no download)
+4. Best of both: dynamic discovery + local performance
+
 ### Running Examples
 
 ```bash
-# Query local segments with catalog
+# Filesystem mode - Query local segments with catalog
 cargo run --package datafusion-pinot --example query_local
 
-# Read a single segment
+# Controller mode - Query using controller API (requires 'controller' feature)
+PINOT_CONTROLLER_URL=http://localhost:9000 \
+PINOT_SEGMENT_DIR=/tmp/pinot/quickstart/PinotServerDataDir0 \
+cargo run --package datafusion-pinot --features controller --example query_controller
+
+# Low-level - Read a single segment directly
 cargo run --package datafusion-pinot --example read_segment
 ```
 
@@ -131,15 +210,19 @@ datafusion-pinot/
 │
 ├── datafusion-pinot/           # DataFusion integration
 │   ├── src/
-│   │   ├── catalog.rs          # Table discovery
+│   │   ├── catalog.rs          # Table discovery & builder
+│   │   ├── controller.rs       # HTTP client (optional)
+│   │   ├── metadata_provider.rs # Discovery abstraction
 │   │   ├── table.rs            # TableProvider
 │   │   ├── exec.rs             # ExecutionPlan
 │   │   └── schema.rs           # Type mapping
 │   ├── tests/
 │   │   ├── query_tests.rs
-│   │   └── catalog_tests.rs
+│   │   ├── catalog_tests.rs
+│   │   └── controller_client_tests.rs
 │   └── examples/
-│       ├── query_local.rs      # Full SQL examples
+│       ├── query_local.rs      # Filesystem mode
+│       ├── query_controller.rs # Controller mode
 │       └── read_segment.rs     # Low-level reading
 ```
 
@@ -158,7 +241,8 @@ datafusion-pinot/
    - Parallel execution (one partition per segment)
 
 3. **Catalog Discovery**
-   - Scans data directory for `*_OFFLINE` / `*_REALTIME` tables
+   - **Filesystem mode**: Scans data directory for `*_OFFLINE` / `*_REALTIME` tables
+   - **Controller mode**: HTTP calls to controller for table/segment lists
    - Auto-registers discovered tables
    - Supports fully qualified names: `pinot.default.tableName`
 
@@ -295,6 +379,62 @@ ctx.register_table("myTable", Arc::new(table))?;
 // Query
 let df = ctx.sql("SELECT COUNT(*) FROM myTable").await?;
 ```
+
+## Troubleshooting
+
+### Controller Mode Issues
+
+**Segments not found locally:**
+```
+Error: Segment baseballStats_OFFLINE_0 not found locally at /tmp/pinot/...
+```
+- **Cause**: Controller API returned segment names, but they don't exist on local filesystem
+- **Solution**: Ensure Docker volume mount matches segment directory:
+  ```bash
+  # Docker -v mount must match -dataDir parameter
+  docker run -v /tmp/pinot:/tmp/data ... -dataDir /tmp/data
+
+  # Then use the host path for segment_dir
+  .with_segment_dir("/tmp/pinot/quickstart/PinotServerDataDir0")
+  ```
+
+**Controller connection refused:**
+```
+Error: HTTP client error: connection refused
+```
+- **Cause**: Controller not accessible at specified URL
+- **Solution**: Verify controller is running and port is exposed:
+  ```bash
+  docker ps  # Check port mapping
+  curl http://localhost:9000/tables  # Test controller API
+  ```
+
+**Understanding Docker volume mounts:**
+```bash
+# -v /tmp/pinot:/tmp/data means:
+#   Host path: /tmp/pinot
+#   Container path: /tmp/data
+#
+# -dataDir /tmp/data tells Pinot to use /tmp/data INSIDE container
+# This creates: /tmp/data/quickstart/PinotServerDataDir0/ (in container)
+# Which maps to: /tmp/pinot/quickstart/PinotServerDataDir0/ (on host)
+#
+# So use the HOST path in with_segment_dir():
+.with_segment_dir("/tmp/pinot/quickstart/PinotServerDataDir0")
+```
+
+### General Issues
+
+**Table names with special characters:**
+```rust
+// Use quoted identifiers for tables with special characters
+ctx.sql("SELECT * FROM pinot.default.\"baseballStats\"").await?;
+```
+
+**No tables discovered:**
+- Verify data directory exists and contains `*_OFFLINE` or `*_REALTIME` subdirectories
+- Check directory permissions
+- Enable logging to see discovery details
 
 ## Contributing
 
