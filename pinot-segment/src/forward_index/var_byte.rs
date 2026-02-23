@@ -324,10 +324,112 @@ impl VarByteChunkReader {
 
     /// Read all values as strings
     pub fn read_all_strings(&self) -> Result<Vec<String>> {
+        // Use optimized chunk-by-chunk reading instead of doc-by-doc
+        self.read_all_strings_chunked()
+    }
+
+    /// Optimized: Read all strings by processing chunks sequentially
+    /// instead of calling get_string() for each doc (which re-decompresses chunks)
+    fn read_all_strings_chunked(&self) -> Result<Vec<String>> {
         let mut values = Vec::with_capacity(self.total_docs as usize);
-        for doc_id in 0..self.total_docs {
-            values.push(self.get_string(doc_id)?);
+
+        // Read metadata to find all chunks
+        let num_entries = self.metadata_size / METADATA_ENTRY_SIZE;
+        let mut file = File::open(&self.file_path)?;
+
+        // Process each chunk
+        for entry_idx in 0..num_entries {
+            // Read metadata entry
+            file.seek(SeekFrom::Start((self.metadata_offset + entry_idx * METADATA_ENTRY_SIZE) as u64))?;
+            let mut entry = [0u8; 8];
+            file.read_exact(&mut entry)?;
+
+            let _chunk_doc_id_offset = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) & 0x7FFFFFFF;
+            let chunk_offset = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]) as usize;
+
+            // Check if this is a "huge value"
+            let is_regular_chunk = (u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) & 0x80000000) == 0;
+
+            // Determine chunk limit
+            let chunk_limit = if (entry_idx + 1) * METADATA_ENTRY_SIZE < self.metadata_size {
+                let mut next_entry = [0u8; 8];
+                file.read_exact(&mut next_entry)?;
+                let next_chunk_offset = u32::from_le_bytes([next_entry[4], next_entry[5], next_entry[6], next_entry[7]]) as usize;
+                if next_chunk_offset == 0xFFFFFFFF {
+                    self.forward_index_size - (self.chunks_offset - self.base_offset)
+                } else {
+                    next_chunk_offset
+                }
+            } else {
+                self.forward_index_size - (self.chunks_offset - self.base_offset)
+            };
+
+            let chunk_size = chunk_limit - chunk_offset;
+
+            // Read and decompress chunk ONCE
+            file.seek(SeekFrom::Start((self.chunks_offset + chunk_offset) as u64))?;
+            let mut chunk_data = vec![0u8; chunk_size];
+            file.read_exact(&mut chunk_data)?;
+
+            let decompressed_chunk = if self.compression_type == PASS_THROUGH {
+                chunk_data
+            } else {
+                self.decompress_chunk(&chunk_data)?
+            };
+
+            // Handle huge values (single value per chunk)
+            if !is_regular_chunk {
+                values.push(String::from_utf8_lossy(&decompressed_chunk).to_string());
+                continue;
+            }
+
+            // Extract all values from this chunk
+            if decompressed_chunk.len() < 8 {
+                return Err(Error::InvalidFormat("Decompressed chunk too small".to_string()));
+            }
+
+            let num_docs_in_chunk = u32::from_le_bytes([
+                decompressed_chunk[0],
+                decompressed_chunk[1],
+                decompressed_chunk[2],
+                decompressed_chunk[3],
+            ]) as usize;
+
+            // Extract all strings from this chunk
+            for doc_idx in 0..num_docs_in_chunk {
+                let offset_pos = 4 + doc_idx * 4;
+                let value_offset = u32::from_le_bytes([
+                    decompressed_chunk[offset_pos],
+                    decompressed_chunk[offset_pos + 1],
+                    decompressed_chunk[offset_pos + 2],
+                    decompressed_chunk[offset_pos + 3],
+                ]) as usize;
+
+                // For last document in chunk, use chunk size as next offset
+                let next_offset = if doc_idx == num_docs_in_chunk - 1 {
+                    decompressed_chunk.len()
+                } else {
+                    let next_offset_pos = offset_pos + 4;
+                    u32::from_le_bytes([
+                        decompressed_chunk[next_offset_pos],
+                        decompressed_chunk[next_offset_pos + 1],
+                        decompressed_chunk[next_offset_pos + 2],
+                        decompressed_chunk[next_offset_pos + 3],
+                    ]) as usize
+                };
+
+                if value_offset > decompressed_chunk.len() || next_offset > decompressed_chunk.len() {
+                    return Err(Error::InvalidFormat(format!(
+                        "Value offsets out of range: {} to {} (chunk size: {})",
+                        value_offset, next_offset, decompressed_chunk.len()
+                    )));
+                }
+
+                let value_bytes = &decompressed_chunk[value_offset..next_offset];
+                values.push(String::from_utf8_lossy(value_bytes).to_string());
+            }
         }
+
         Ok(values)
     }
 
