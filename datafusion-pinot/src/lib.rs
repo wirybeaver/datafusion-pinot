@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod error;
 pub mod exec;
+pub mod metadata_provider;
 pub mod schema;
 pub mod table;
 
@@ -11,6 +12,7 @@ pub mod controller;
 
 pub use catalog::PinotCatalog;
 pub use error::{Error, Result};
+pub use metadata_provider::MetadataProvider;
 pub use table::PinotTable;
 
 #[cfg(feature = "controller")]
