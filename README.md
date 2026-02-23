@@ -6,14 +6,10 @@ A Rust library that integrates Apache Pinot's segment format with Apache DataFus
 
 ## Features
 
-✅ **Full SQL Support** - Execute SQL queries on Pinot segments using DataFusion
-✅ **Dictionary & RAW Encoding** - Read both dictionary-encoded and RAW columns
-✅ **LZ4 Compression** - Support for LZ4-compressed RAW columns
-✅ **Multi-Segment Tables** - Query tables with multiple segments in parallel
-✅ **Automatic Discovery** - Catalog-based table discovery via filesystem or controller API
-✅ **Zero-Copy** - Direct segment reading without Pinot server overhead
-✅ **Type Safety** - Full Rust type system with Arrow integration
-✅ **Controller API Support** - Dynamic table discovery from running Pinot clusters
+- **Basic SQL Support** - Execute SQL queries on Pinot segments using DataFusion
+- **Dictionary & RAW Encoding** - Read both dictionary-encoded and RAW columns
+- **LZ4 Compression** - Support for LZ4-compressed RAW columns
+- **Automatic Discovery** - Catalog-based table discovery via filesystem or controller API
 
 ## Quick Start
 
