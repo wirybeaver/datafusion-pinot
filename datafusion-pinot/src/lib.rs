@@ -17,3 +17,6 @@ pub use table::PinotTable;
 
 #[cfg(feature = "controller")]
 pub use controller::PinotControllerClient;
+
+#[cfg(feature = "controller")]
+pub use metadata_provider::ControllerMetadataProvider;

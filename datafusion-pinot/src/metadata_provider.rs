@@ -12,6 +12,12 @@ use async_trait::async_trait;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "controller")]
+use std::sync::Arc;
+
+#[cfg(feature = "controller")]
+use crate::controller::PinotControllerClient;
+
 /// Trait for discovering Pinot table metadata and segment locations
 ///
 /// This trait abstracts whether metadata comes from:
@@ -202,6 +208,161 @@ impl MetadataProvider for FileSystemMetadataProvider {
         // Sort for consistent ordering
         segment_paths.sort();
         Ok(segment_paths)
+    }
+}
+
+/// Controller-based metadata provider (hybrid mode)
+///
+/// Discovers tables via HTTP calls to the Pinot controller, but reads segment
+/// data from local filesystem. This enables dynamic table discovery without
+/// requiring specific directory structure, while maintaining zero-copy local
+/// segment access.
+///
+/// # Hybrid Approach
+/// - **Metadata**: Controller HTTP API provides table list and segment names
+/// - **Data**: Local filesystem provides actual segment files
+///
+/// # Example
+/// ```ignore
+/// use datafusion_pinot::metadata_provider::ControllerMetadataProvider;
+/// use datafusion_pinot::controller::PinotControllerClient;
+/// use std::sync::Arc;
+///
+/// let client = Arc::new(PinotControllerClient::new("http://localhost:9000"));
+/// let provider = ControllerMetadataProvider::new(client, "/tmp/pinot/quickstart/PinotServerDataDir0");
+/// let tables = provider.list_tables().await?;
+/// ```
+#[cfg(feature = "controller")]
+#[derive(Debug, Clone)]
+pub struct ControllerMetadataProvider {
+    client: Arc<PinotControllerClient>,
+    segment_dir: PathBuf,
+}
+
+#[cfg(feature = "controller")]
+impl ControllerMetadataProvider {
+    /// Create a new controller-based metadata provider
+    ///
+    /// # Arguments
+    /// * `client` - Pinot controller HTTP client
+    /// * `segment_dir` - Local directory containing segment data (e.g., `/tmp/pinot/quickstart/PinotServerDataDir0`)
+    ///
+    /// # Example
+    /// ```ignore
+    /// use datafusion_pinot::metadata_provider::ControllerMetadataProvider;
+    /// use datafusion_pinot::controller::PinotControllerClient;
+    /// use std::sync::Arc;
+    ///
+    /// let client = Arc::new(PinotControllerClient::new("http://localhost:9000"));
+    /// let provider = ControllerMetadataProvider::new(client, "/tmp/pinot/quickstart/PinotServerDataDir0");
+    /// ```
+    pub fn new(client: Arc<PinotControllerClient>, segment_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            client,
+            segment_dir: segment_dir.into(),
+        }
+    }
+
+    /// Get the segment directory path
+    pub fn segment_dir(&self) -> &Path {
+        &self.segment_dir
+    }
+
+    /// Get the controller client
+    pub fn client(&self) -> &Arc<PinotControllerClient> {
+        &self.client
+    }
+}
+
+#[cfg(feature = "controller")]
+#[async_trait]
+impl MetadataProvider for ControllerMetadataProvider {
+    async fn list_tables(&self) -> Result<Vec<String>> {
+        // Get table list from controller
+        self.client.list_tables().await
+    }
+
+    async fn table_exists(&self, name: &str) -> bool {
+        // Check both controller and local filesystem
+        // First check controller
+        if let Ok(tables) = self.client.list_tables().await {
+            if !tables.iter().any(|t| t == name) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        // Then verify local directories exist
+        let offline_dir = self.segment_dir.join(format!("{}_OFFLINE", name));
+        let realtime_dir = self.segment_dir.join(format!("{}_REALTIME", name));
+        offline_dir.exists() || realtime_dir.exists()
+    }
+
+    async fn get_segment_paths(&self, table_name: &str) -> Result<Vec<PathBuf>> {
+        // Get segment names from controller (try OFFLINE first, then REALTIME)
+        let segment_names = self.client.list_segments(table_name, "OFFLINE").await?;
+
+        if segment_names.is_empty() {
+            // Try REALTIME if OFFLINE is empty
+            let realtime_segments = self.client.list_segments(table_name, "REALTIME").await?;
+            if realtime_segments.is_empty() {
+                return Err(Error::Internal(format!(
+                    "No segments found for table '{}' in controller",
+                    table_name
+                )));
+            }
+            return self.map_segments_to_paths(table_name, &realtime_segments, "REALTIME");
+        }
+
+        self.map_segments_to_paths(table_name, &segment_names, "OFFLINE")
+    }
+}
+
+#[cfg(feature = "controller")]
+impl ControllerMetadataProvider {
+    /// Map segment names from controller to local filesystem paths
+    fn map_segments_to_paths(
+        &self,
+        table_name: &str,
+        segment_names: &[String],
+        table_type: &str,
+    ) -> Result<Vec<PathBuf>> {
+        let table_dir = self
+            .segment_dir
+            .join(format!("{}_{}", table_name, table_type));
+
+        if !table_dir.exists() {
+            return Err(Error::Internal(format!(
+                "Table directory not found: {}",
+                table_dir.display()
+            )));
+        }
+
+        let mut paths = Vec::new();
+        for segment_name in segment_names {
+            let segment_path = table_dir.join(segment_name).join("v3");
+            if segment_path.exists() {
+                paths.push(segment_path);
+            } else {
+                return Err(Error::Internal(format!(
+                    "Segment {} not found locally at {}",
+                    segment_name,
+                    segment_path.display()
+                )));
+            }
+        }
+
+        if paths.is_empty() {
+            return Err(Error::Internal(format!(
+                "No valid segment paths found for table '{}'",
+                table_name
+            )));
+        }
+
+        // Sort for consistent ordering
+        paths.sort();
+        Ok(paths)
     }
 }
 
