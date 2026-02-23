@@ -388,4 +388,83 @@ mod tests {
         let schema = table.schema();
         assert!(schema.fields().len() > 0, "Table should have fields");
     }
+
+    #[test]
+    fn test_builder_filesystem_mode() {
+        if !Path::new(DATA_DIR).exists() {
+            println!("Skipping test: data directory not found");
+            return;
+        }
+
+        let catalog = PinotCatalog::builder()
+            .filesystem(DATA_DIR)
+            .build()
+            .expect("Failed to build catalog");
+
+        let schema_names = catalog.schema_names();
+        assert!(schema_names.contains(&"default".to_string()));
+    }
+
+    #[test]
+    fn test_builder_missing_source() {
+        let result = PinotCatalog::builder().build();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No catalog source configured"));
+    }
+
+    #[test]
+    fn test_builder_nonexistent_directory() {
+        let result = PinotCatalog::builder()
+            .filesystem("/nonexistent/path/12345")
+            .build();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("does not exist"));
+    }
+
+    #[cfg(feature = "controller")]
+    #[test]
+    fn test_builder_controller_mode() {
+        if !Path::new(DATA_DIR).exists() {
+            println!("Skipping test: data directory not found");
+            return;
+        }
+
+        let result = PinotCatalog::builder()
+            .controller("http://localhost:9000")
+            .with_segment_dir(DATA_DIR)
+            .build();
+
+        // Should succeed in building (controller connection will be tested separately)
+        assert!(result.is_ok());
+    }
+
+    #[cfg(feature = "controller")]
+    #[test]
+    fn test_builder_controller_missing_url() {
+        let result = PinotCatalog::builder()
+            .with_segment_dir(DATA_DIR)
+            .build();
+
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "controller")]
+    #[test]
+    fn test_builder_controller_missing_segment_dir() {
+        let result = PinotCatalog::builder()
+            .controller("http://localhost:9000")
+            .build();
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Segment directory not specified"));
+    }
 }
