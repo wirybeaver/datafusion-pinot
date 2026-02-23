@@ -27,6 +27,14 @@
 //!    PINOT_SEGMENT_DIR=/tmp/pinot/quickstart/PinotServerDataDir0 \
 //!    cargo run --features controller --example query_controller
 //!    ```
+//!
+//! ## Note
+//!
+//! This example uses HTTP only (not HTTPS). The controller feature is configured
+//! for HTTP-only connections, which is appropriate for:
+//! - Localhost connections (http://localhost:9000)
+//! - Private network deployments
+//! - Development and testing environments
 
 #[cfg(feature = "controller")]
 use datafusion::prelude::*;

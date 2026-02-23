@@ -123,9 +123,8 @@ docker run -d \
   -type batch \
   -dataDir /tmp/data
 
-# Now segments are accessible at:
-# - Controller API: http://localhost:9000
-# - Local filesystem: /tmp/pinot/quickstart/PinotServerDataDir0
+# Controller API is available at http://localhost:9000 (HTTP only, no HTTPS)
+# Segments are accessible at: /tmp/pinot/quickstart/PinotServerDataDir0
 ```
 
 **How it works:**
@@ -133,6 +132,11 @@ docker run -d \
 2. Controller API (`GET /segments/{table}?type=OFFLINE`) lists segment names
 3. Segment data read from local filesystem (zero-copy, no download)
 4. Best of both: dynamic discovery + local performance
+
+**Note:** Controller mode uses HTTP only (not HTTPS). This is appropriate for:
+- Localhost connections (`http://localhost:9000`)
+- Private network deployments
+- Development and testing environments
 
 ### Running Examples
 
