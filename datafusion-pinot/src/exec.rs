@@ -62,13 +62,12 @@ impl PinotExec {
         }
     }
 
-    fn create_batch(
+    /// Read all columns once (optimization to avoid re-reading for each batch)
+    fn read_columns_once(
         segment_reader: &SegmentReader,
-        schema: &SchemaRef,
+        _schema: &SchemaRef,
         projection: &Option<Vec<usize>>,
-        offset: usize,
-        limit: usize,
-    ) -> Result<RecordBatch> {
+    ) -> Result<Vec<ArrayRef>> {
         let column_names: Vec<String> = if let Some(ref proj) = projection {
             proj.iter()
                 .map(|&idx| {
@@ -92,9 +91,7 @@ impl PinotExec {
 
         // Handle empty projection (e.g., COUNT(*) queries)
         if column_names.is_empty() {
-            let options = RecordBatchOptions::new().with_row_count(Some(limit));
-            return RecordBatch::try_new_with_options(schema.clone(), vec![], &options)
-                .map_err(|e| Error::Internal(format!("Failed to create RecordBatch: {}", e)));
+            return Ok(vec![]);
         }
 
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_names.len());
@@ -107,69 +104,34 @@ impl PinotExec {
 
             let array: ArrayRef = match col_meta.data_type {
                 PinotDataType::Int => {
-                    let mut values = segment_reader
+                    let values = segment_reader
                         .read_int_column(column_name)
                         .map_err(|e| Error::Internal(e.to_string()))?;
-
-                    let batch_values = if offset + limit <= values.len() {
-                        values.drain(offset..offset + limit).collect::<Vec<_>>()
-                    } else {
-                        values.drain(offset..).collect::<Vec<_>>()
-                    };
-
-                    Arc::new(Int32Array::from(batch_values))
+                    Arc::new(Int32Array::from(values))
                 }
                 PinotDataType::Long => {
-                    let mut values = segment_reader
+                    let values = segment_reader
                         .read_long_column(column_name)
                         .map_err(|e| Error::Internal(e.to_string()))?;
-
-                    let batch_values = if offset + limit <= values.len() {
-                        values.drain(offset..offset + limit).collect::<Vec<_>>()
-                    } else {
-                        values.drain(offset..).collect::<Vec<_>>()
-                    };
-
-                    Arc::new(Int64Array::from(batch_values))
+                    Arc::new(Int64Array::from(values))
                 }
                 PinotDataType::Float => {
-                    let mut values = segment_reader
+                    let values = segment_reader
                         .read_float_column(column_name)
                         .map_err(|e| Error::Internal(e.to_string()))?;
-
-                    let batch_values = if offset + limit <= values.len() {
-                        values.drain(offset..offset + limit).collect::<Vec<_>>()
-                    } else {
-                        values.drain(offset..).collect::<Vec<_>>()
-                    };
-
-                    Arc::new(Float32Array::from(batch_values))
+                    Arc::new(Float32Array::from(values))
                 }
                 PinotDataType::Double => {
-                    let mut values = segment_reader
+                    let values = segment_reader
                         .read_double_column(column_name)
                         .map_err(|e| Error::Internal(e.to_string()))?;
-
-                    let batch_values = if offset + limit <= values.len() {
-                        values.drain(offset..offset + limit).collect::<Vec<_>>()
-                    } else {
-                        values.drain(offset..).collect::<Vec<_>>()
-                    };
-
-                    Arc::new(Float64Array::from(batch_values))
+                    Arc::new(Float64Array::from(values))
                 }
                 PinotDataType::String => {
-                    let mut values = segment_reader
+                    let values = segment_reader
                         .read_string_column(column_name)
                         .map_err(|e| Error::Internal(e.to_string()))?;
-
-                    let batch_values = if offset + limit <= values.len() {
-                        values.drain(offset..offset + limit).collect::<Vec<_>>()
-                    } else {
-                        values.drain(offset..).collect::<Vec<_>>()
-                    };
-
-                    Arc::new(StringArray::from(batch_values))
+                    Arc::new(StringArray::from(values))
                 }
                 _ => {
                     return Err(Error::UnsupportedFeature(format!(
@@ -182,7 +144,30 @@ impl PinotExec {
             arrays.push(array);
         }
 
-        RecordBatch::try_new(schema.clone(), arrays)
+        Ok(arrays)
+    }
+
+    /// Create a batch by slicing pre-read column arrays
+    fn create_batch_from_arrays(
+        column_arrays: &[ArrayRef],
+        schema: &SchemaRef,
+        offset: usize,
+        limit: usize,
+    ) -> Result<RecordBatch> {
+        // Handle empty projection (e.g., COUNT(*) queries)
+        if column_arrays.is_empty() {
+            let options = RecordBatchOptions::new().with_row_count(Some(limit));
+            return RecordBatch::try_new_with_options(schema.clone(), vec![], &options)
+                .map_err(|e| Error::Internal(format!("Failed to create RecordBatch: {}", e)));
+        }
+
+        // Slice each column array for this batch
+        let sliced_arrays: Vec<ArrayRef> = column_arrays
+            .iter()
+            .map(|array| array.slice(offset, limit))
+            .collect();
+
+        RecordBatch::try_new(schema.clone(), sliced_arrays)
             .map_err(|e| Error::Internal(format!("Failed to create RecordBatch: {}", e)))
     }
 }
@@ -248,12 +233,16 @@ impl ExecutionPlan for PinotExec {
         let schema = self.schema.clone();
         let projection = self.projection.clone();
 
-        // Create batches for this segment
+        // OPTIMIZATION: Read all columns ONCE instead of re-reading for each batch
+        let column_arrays = Self::read_columns_once(&segment_reader, &schema, &projection)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Create batches by slicing the pre-read column data
         let batches = (0..total_docs)
             .step_by(BATCH_SIZE)
             .map(|offset| {
                 let limit = BATCH_SIZE.min(total_docs - offset);
-                Self::create_batch(&segment_reader, &schema, &projection, offset, limit)
+                Self::create_batch_from_arrays(&column_arrays, &schema, offset, limit)
             })
             .collect::<Result<Vec<_>>>()
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
