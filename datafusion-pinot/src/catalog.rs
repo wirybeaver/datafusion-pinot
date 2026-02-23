@@ -290,44 +290,59 @@ impl SchemaProvider for PinotSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        // Convert async to sync - try to use existing runtime, or create one if needed
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => handle
-                .block_on(self.metadata_provider.list_tables())
-                .unwrap_or_default(),
-            Err(_) => {
-                // No runtime exists, create a temporary one
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(self.metadata_provider.list_tables())
-                    .unwrap_or_default()
-            }
-        }
+        // Convert async to sync by spawning a separate thread with its own runtime
+        // This avoids "cannot block_on within a runtime" errors
+        let provider = self.metadata_provider.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(provider.list_tables()).unwrap_or_default()
+        })
+        .join()
+        .unwrap_or_default()
     }
 
     async fn table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
+        // DataFusion lowercases table names, so we need to find the actual case-sensitive name
+        let tables = self.metadata_provider.list_tables().await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Find the actual table name (case-insensitive match)
+        let actual_name = tables.iter()
+            .find(|t| t.eq_ignore_ascii_case(name))
+            .map(|s| s.as_str());
+
+        let table_name = match actual_name {
+            Some(name) => name,
+            None => return Ok(None),
+        };
+
         // Get segment paths from metadata provider
-        let segment_paths = match self.metadata_provider.get_segment_paths(name).await {
+        let segment_paths = match self.metadata_provider.get_segment_paths(table_name).await {
             Ok(paths) => paths,
             Err(_) => return Ok(None),
         };
 
         // Open table from segment paths
-        match PinotTable::open_segments(&segment_paths, name) {
+        match PinotTable::open_segments(&segment_paths, table_name) {
             Ok(table) => Ok(Some(Arc::new(table))),
             Err(e) => Err(DataFusionError::External(Box::new(e))),
         }
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        // Convert async to sync - try to use existing runtime, or create one if needed
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => handle.block_on(self.metadata_provider.table_exists(name)),
-            Err(_) => {
-                // No runtime exists, create a temporary one
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(self.metadata_provider.table_exists(name))
-            }
-        }
+        // Convert async to sync by spawning a separate thread with its own runtime
+        // This avoids "cannot block_on within a runtime" errors
+        // Note: DataFusion lowercases table names, so we need case-insensitive matching
+        let provider = self.metadata_provider.clone();
+        let name = name.to_string();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let tables = rt.block_on(provider.list_tables()).unwrap_or_default();
+            // Case-insensitive search
+            tables.iter().any(|t| t.eq_ignore_ascii_case(&name))
+        })
+        .join()
+        .unwrap_or(false)
     }
 }
 

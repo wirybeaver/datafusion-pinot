@@ -95,11 +95,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!();
 
-        // Sample query with aggregation
+        // Sample query with aggregation (using quoted identifiers for case-sensitive columns)
         let sample_query =
-            "SELECT playerName, AVG(homeRuns) as avg_home_runs \
+            "SELECT \"playerName\", AVG(\"homeRuns\") as avg_home_runs \
              FROM pinot.default.baseballStats \
-             GROUP BY playerName \
+             GROUP BY \"playerName\" \
              ORDER BY avg_home_runs DESC \
              LIMIT 5";
         println!("Query: {}", sample_query);
