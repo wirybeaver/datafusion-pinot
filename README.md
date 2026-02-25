@@ -279,16 +279,29 @@ datafusion-pinot/
 
 ## Performance
 
-**Current Implementation:**
-- Reads columns in batches of 8,192 rows
-- One partition per segment (parallel execution)
-- Efficient bit-packing decoder
-- LZ4 block decompression
+**Key Optimizations:**
+- **Chunk-by-chunk decompression** for RAW columns - Process LZ4-compressed chunks sequentially, decompressing each chunk once and extracting all values, instead of decompressing per document
+- **Column read caching** - Read each column into Arrow arrays once, then slice batches from pre-loaded data instead of re-reading for every batch
+- **Batch processing** - Process data in 8,192-row chunks for efficient memory usage
+- **Parallel execution** - One partition per segment enables concurrent segment processing
+- **Efficient bit-packing** - Optimized decoder for dictionary-encoded columns
 
-**Benchmark Results** (97,889 row segment):
-- Full table scan: ~50-56 seconds
-- COUNT(*): ~50ms
-- Simple aggregations: ~50-56 seconds
+**Benchmark Results** (baseballStats: 97,889 rows, release build):
+
+| Query Type | Time | SQL |
+|------------|------|-----|
+| COUNT(*) | 3.97ms | `SELECT COUNT(*) FROM baseballStats` |
+| Full scan (dictionary) | 36.15ms | `SELECT "playerName", "hits", "homeRuns" FROM baseballStats` |
+| Full scan (RAW) | 14.21ms | `SELECT "playerID", "hits", "homeRuns" FROM baseballStats` |
+| Aggregation | 7.05ms | `SELECT SUM("hits"), AVG("homeRuns"), MAX("strikeouts") FROM baseballStats` |
+| GROUP BY | 18.17ms | `SELECT "teamID", COUNT(*), SUM("hits") FROM baseballStats GROUP BY "teamID" ORDER BY SUM("hits") DESC LIMIT 10` |
+| GROUP BY (RAW) | 22.97ms | `SELECT "playerID", AVG("homeRuns") FROM baseballStats GROUP BY "playerID" ORDER BY AVG("homeRuns") DESC LIMIT 10` |
+| LIMIT 10 | 15.10ms | `SELECT "playerID", "hits", "homeRuns" FROM baseballStats LIMIT 10` |
+
+Run benchmarks yourself:
+```bash
+cargo run --example benchmark --release
+```
 
 ## Limitations
 
